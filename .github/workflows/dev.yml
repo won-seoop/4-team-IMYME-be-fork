@@ -29,7 +29,14 @@ jobs:
     steps:
       # 1. Checkout
       - name: Checkout code
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21 (with Gradle cache)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: gradle
 
       # ========================================
       # 5. 정적 분석 (Static Analysis)
@@ -47,13 +54,23 @@ jobs:
       - name: Run Checkstyle
         run: ./gradlew checkstyleMain
 
-      # 6. ECS 배포용 도커 이미지 빌드
-      - name: Build Docker image
-        run: docker build -f ./Dockerfile -t "${{ secrets.ECR_REPOSITORY_URI }}:${{ github.sha }}" .
-
       # 7. 테스트
       - name: Run Tests
-        run: docker run --rm -v "${{ github.workspace }}:/workspace" -w /workspace gradle:8.14.3-jdk21 gradle test
+        run: ./gradlew test
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # 6. ECS 배포용 도커 이미지 빌드
+      - name: Build Docker image (with cache)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false
+          tags: ${{ secrets.ECR_REPOSITORY_URI }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
   ci-notify-success:
     needs: ci
