@@ -49,7 +49,7 @@ jobs:
 
       # 6. ECS 배포용 도커 이미지 빌드
       - name: Build Docker image
-        run: docker build -t "${{ secrets.ECR_REPOSITORY_URI }}:${{ github.sha }}" .
+        run: docker build -f ./Dockerfile -t "${{ secrets.ECR_REPOSITORY_URI }}:${{ github.sha }}" .
 
       # 7. 테스트
       - name: Run Tests
@@ -86,7 +86,8 @@ jobs:
   # 2) CD
   cd:
     needs: ci
-    if: github.event_name == 'push' && github.ref == 'refs/heads/dev'
+    # if: github.event_name == 'push' && github.ref == 'refs/heads/dev'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/infra/cicd-mvp2'
 
 
     runs-on: ubuntu-latest
