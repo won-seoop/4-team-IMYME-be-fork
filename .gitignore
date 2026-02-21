@@ -67,3 +67,6 @@ k6-tests/*.json
 /monitoring/QUICKSTART.md
 /k6-tests/README.md
 /monitoring/README.md
+
+#Docker
+docker-compose.yml
