@@ -70,3 +70,4 @@ k6-tests/*.json
 
 #Docker
 docker-compose.yml
+build.sh

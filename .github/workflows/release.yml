@@ -1,0 +1,234 @@
+name: Backend CI/CD release mvp2
+
+on:
+#   pull_request:
+#     branches:
+#       - infra/cicd-mvp2
+# #      - infra/cicd
+
+  push:
+    branches:
+#      - infra/cicd
+      - infra/cicd-mvp2
+      # - dev   # dev merge 결과 → CD
+
+permissions:
+  contents: read
+
+concurrency:
+  group: backend-cicd-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+
+  # 1) CI
+  ci:
+    if: github.event_name == 'pull_request' || github.event_name == 'push' # pr 및 push 일때만 실행
+    runs-on: ubuntu-latest # 워크플로우 실행 러너 지정
+
+    steps:
+      # 1. Checkout
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21 (with Gradle cache)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: gradle
+
+      # ========================================
+      # 5. 정적 분석 (Static Analysis)
+      # ========================================
+
+      # SpotBugs(버그패턴 캐치) : null위험, 무한 루프 등
+      - name: Run SpotBugs
+        run: ./gradlew spotbugsMain
+
+      # PMD(좋지 않은 코드 습관 캐치) : 중복코드, 안쓰는 변수 등
+      - name: Run PMD
+        run: ./gradlew pmdMain
+
+      # Checkstyle(코드 스타일) : 들여쓰기, 네이밍 규칙, 공백 등
+      - name: Run Checkstyle
+        run: ./gradlew checkstyleMain
+
+      # 7. 테스트
+      - name: Run Tests
+        run: ./gradlew test
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # 6. ECS 배포용 도커 이미지 빌드
+      - name: Build Docker image (with cache)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false
+          tags: ${{ secrets.ECR_REPOSITORY_URI_RELEASE }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  ci-notify-success:
+    needs: ci
+    if: success()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Discord CI success
+        uses: sarisia/actions-status-discord@v1
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_BE }}
+          status: success
+          title: "🟢 개발서버 백엔드 CI 성공"
+          content: "<@&${{ secrets.BACKEND_ROLE_ID }}> 개발서버 백엔드 CI 성공!"
+          color: 0x00FF00
+
+  ci-notify-failure:
+    needs: ci
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Discord CI failure
+        uses: sarisia/actions-status-discord@v1
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_BE }}
+          status: failure
+          title: "🔴 개발서버 백엔드 CI 실패"
+          content: "<@&${{ secrets.BACKEND_ROLE_ID }}> 개발서버 백엔드 CI 실패!"
+          color: 0xFF0000
+
+  # 2) CD
+  cd:
+    needs: ci
+    # if: github.event_name == 'push' && github.ref == 'refs/heads/dev'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/infra/cicd-mvp2'
+
+
+    runs-on: ubuntu-latest
+
+    # test ec2 public ip : 15.164.94.102
+    steps:
+      # CD에서도 Dockerfile/배포 리소스를 사용하므로 소스 체크아웃
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # AWS API 호출(ECR push, ECS update)을 위한 자격 증명 설정
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ap-northeast-2
+
+      # ECR 로그인 후 docker push 가능 상태로 전환
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # Buildx 사용 + GHA 캐시로 이미지 빌드 속도 개선
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # 커밋 SHA 태그로 이미지를 빌드/푸시 (불변 태그 전략)
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ secrets.ECR_REPOSITORY_URI_RELEASE }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # 현재 서비스 task definition을 복제해 컨테이너 이미지 태그만 SHA로 교체
+      - name: Deploy to ECS service (sha tag)
+        run: |
+          IMAGE_URI="${{ secrets.ECR_REPOSITORY_URI_RELEASE }}:${{ github.sha }}"
+
+          CURRENT_TASK_DEF_ARN=$(aws ecs describe-services \
+            --cluster "${{ secrets.ECS_CLUSTER_NAME }}" \
+            --services "${{ secrets.ECS_SERVICE_NAME }}" \
+            --region ap-northeast-2 \
+            --query "services[0].taskDefinition" \
+            --output text)
+
+          aws ecs describe-task-definition \
+            --task-definition "$CURRENT_TASK_DEF_ARN" \
+            --region ap-northeast-2 \
+            --query taskDefinition \
+            --output json > task-def.json
+
+          jq --arg IMAGE_URI "$IMAGE_URI" --arg CONTAINER_NAME "${{ secrets.ECS_CONTAINER_NAME }}" '
+            .containerDefinitions |= map(
+              if .name == $CONTAINER_NAME then .image = $IMAGE_URI else . end
+            )
+            | del(
+                .taskDefinitionArn,
+                .revision,
+                .status,
+                .requiresAttributes,
+                .compatibilities,
+                .registeredAt,
+                .registeredBy
+              )
+          ' task-def.json > new-task-def.json
+
+          NEW_TASK_DEF_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file://new-task-def.json \
+            --region ap-northeast-2 \
+            --query "taskDefinition.taskDefinitionArn" \
+            --output text)
+
+          aws ecs update-service \
+            --cluster "${{ secrets.ECS_CLUSTER_NAME }}" \
+            --service "${{ secrets.ECS_SERVICE_NAME }}" \
+            --task-definition "$NEW_TASK_DEF_ARN" \
+            --region ap-northeast-2
+
+      # 새 태스크가 정상 상태가 될 때까지 대기
+      - name: Wait for ECS service stability
+        run: |
+          aws ecs wait services-stable \
+            --cluster "${{ secrets.ECS_CLUSTER_NAME }}" \
+            --services "${{ secrets.ECS_SERVICE_NAME }}" \
+            --region ap-northeast-2
+
+      # 5️⃣ 배포 후 스모크 테스트
+      - name: Post-deploy Smoke Test
+        run: |
+            set -e
+            BASE_URL="http://15.164.94.102"
+            # Nginx가 물려있는 엔드포인트로 헬스체크
+            curl -fsS "$BASE_URL/server/health" >/dev/null
+            # 카테고리 리스트업
+            curl -fsS "$BASE_URL/server/categories" >/dev/null
+
+  cd-notify-success:
+    needs: cd
+    if: success()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Discord CD success
+        uses: sarisia/actions-status-discord@v1
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_BE }}
+          status: success
+          title: "🟢 개발서버 백엔드 배포 성공"
+          content: "개발서버 백엔드 배포 완료!"
+          color: 0x00FF00
+
+  cd-notify-failure:
+    needs: cd
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Discord CD failure
+        uses: sarisia/actions-status-discord@v1
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK_BE }}
+          status: failure
+          title: "🔴 개발서버 백엔드 배포 실패"
+          content: "<@&${{ secrets.BACKEND_ROLE_ID }}> 개발서버 백엔드 배포 실패!"
+          color: 0xFF0000
