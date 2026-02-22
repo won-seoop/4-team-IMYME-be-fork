@@ -156,7 +156,7 @@ jobs:
             --targets "Key=tag:aws:autoscaling:groupName,Values=mine_mvp1_be_asg" \
             --comment "backend release deploy (${GITHUB_SHA})" \
             --parameters "commands=[
-              \"set -euo pipefail\",
+              \"set -eu\",
               \"cd /home/ubuntu\",
               \"aws ecr get-login-password --region ap-northeast-2 | docker login --username AWS --password-stdin 219268921033.dkr.ecr.ap-northeast-2.amazonaws.com\",
               \"docker pull ${IMAGE_URI}\",
