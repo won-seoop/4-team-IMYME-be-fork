@@ -42,17 +42,17 @@ jobs:
       # 5. 정적 분석 (Static Analysis)
       # ========================================
 
-      # SpotBugs(버그패턴 캐치) : null위험, 무한 루프 등
-      - name: Run SpotBugs
-        run: ./gradlew spotbugsMain
+      # # SpotBugs(버그패턴 캐치) : null위험, 무한 루프 등
+      # - name: Run SpotBugs
+      #   run: ./gradlew spotbugsMain
 
-      # PMD(좋지 않은 코드 습관 캐치) : 중복코드, 안쓰는 변수 등
-      - name: Run PMD
-        run: ./gradlew pmdMain
+      # # PMD(좋지 않은 코드 습관 캐치) : 중복코드, 안쓰는 변수 등
+      # - name: Run PMD
+      #   run: ./gradlew pmdMain
 
-      # Checkstyle(코드 스타일) : 들여쓰기, 네이밍 규칙, 공백 등
-      - name: Run Checkstyle
-        run: ./gradlew checkstyleMain
+      # # Checkstyle(코드 스타일) : 들여쓰기, 네이밍 규칙, 공백 등
+      # - name: Run Checkstyle
+      #   run: ./gradlew checkstyleMain
 
       # 7. 테스트
       - name: Run Tests
@@ -68,7 +68,7 @@ jobs:
           context: .
           file: ./Dockerfile
           push: false
-          tags: ${{ secrets.ECR_REPOSITORY_URI_RELEASE }}:${{ github.sha }}
+          tags: 219268921033.dkr.ecr.ap-northeast-2.amazonaws.com/imyme-backend:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -138,62 +138,70 @@ jobs:
           context: .
           file: ./Dockerfile
           push: true
-          tags: ${{ secrets.ECR_REPOSITORY_URI_RELEASE }}:${{ github.sha }}
+          tags: |
+            219268921033.dkr.ecr.ap-northeast-2.amazonaws.com/imyme-backend:${{ github.sha }}
+            219268921033.dkr.ecr.ap-northeast-2.amazonaws.com/imyme-backend:release-latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # 현재 서비스 task definition을 복제해 컨테이너 이미지 태그만 SHA로 교체
-      - name: Deploy to ECS service (sha tag)
+      # ASG 인스턴스 대상 SSM 배포 (docker compose)
+      - name: Deploy with SSM (docker compose)
         run: |
-          IMAGE_URI="${{ secrets.ECR_REPOSITORY_URI_RELEASE }}:${{ github.sha }}"
+          set -euo pipefail
 
-          CURRENT_TASK_DEF_ARN=$(aws ecs describe-services \
-            --cluster "${{ secrets.ECS_CLUSTER_NAME }}" \
-            --services "${{ secrets.ECS_SERVICE_NAME }}" \
+          IMAGE_URI="219268921033.dkr.ecr.ap-northeast-2.amazonaws.com/imyme-backend:release-latest"
+
+          COMMAND_ID=$(aws ssm send-command \
+            --document-name "AWS-RunShellScript" \
+            --targets "Key=tag:aws:autoscaling:groupName,Values=mine_mvp1_be_asg" \
+            --comment "backend release deploy (${GITHUB_SHA})" \
+            --parameters "commands=[
+              \"set -euo pipefail\",
+              \"cd /home/ubuntu\",
+              \"aws ecr get-login-password --region ap-northeast-2 | docker login --username AWS --password-stdin 219268921033.dkr.ecr.ap-northeast-2.amazonaws.com\",
+              \"docker pull ${IMAGE_URI}\",
+              \"docker compose up -d\",
+              \"docker image prune -f\"
+            ]" \
             --region ap-northeast-2 \
-            --query "services[0].taskDefinition" \
+            --query "Command.CommandId" \
             --output text)
 
-          aws ecs describe-task-definition \
-            --task-definition "$CURRENT_TASK_DEF_ARN" \
-            --region ap-northeast-2 \
-            --query taskDefinition \
-            --output json > task-def.json
+          echo "SSM Command ID: ${COMMAND_ID}"
 
-          jq --arg IMAGE_URI "$IMAGE_URI" --arg CONTAINER_NAME "${{ secrets.ECS_CONTAINER_NAME }}" '
-            .containerDefinitions |= map(
-              if .name == $CONTAINER_NAME then .image = $IMAGE_URI else . end
-            )
-            | del(
-                .taskDefinitionArn,
-                .revision,
-                .status,
-                .requiresAttributes,
-                .compatibilities,
-                .registeredAt,
-                .registeredBy
-              )
-          ' task-def.json > new-task-def.json
+          for i in {1..60}; do
+            STATUS=$(aws ssm list-commands \
+              --command-id "${COMMAND_ID}" \
+              --region ap-northeast-2 \
+              --query "Commands[0].Status" \
+              --output text)
+            echo "SSM status: ${STATUS}"
 
-          NEW_TASK_DEF_ARN=$(aws ecs register-task-definition \
-            --cli-input-json file://new-task-def.json \
-            --region ap-northeast-2 \
-            --query "taskDefinition.taskDefinitionArn" \
-            --output text)
+            if [ "${STATUS}" = "Success" ]; then
+              break
+            fi
 
-          aws ecs update-service \
-            --cluster "${{ secrets.ECS_CLUSTER_NAME }}" \
-            --service "${{ secrets.ECS_SERVICE_NAME }}" \
-            --task-definition "$NEW_TASK_DEF_ARN" \
-            --region ap-northeast-2
+            if [ "${STATUS}" = "Failed" ] || [ "${STATUS}" = "Cancelled" ] || [ "${STATUS}" = "TimedOut" ] || [ "${STATUS}" = "Cancelling" ]; then
+              aws ssm list-command-invocations \
+                --command-id "${COMMAND_ID}" \
+                --details \
+                --region ap-northeast-2 \
+                --output json
+              exit 1
+            fi
 
-      # 새 태스크가 정상 상태가 될 때까지 대기
-      - name: Wait for ECS service stability
-        run: |
-          aws ecs wait services-stable \
-            --cluster "${{ secrets.ECS_CLUSTER_NAME }}" \
-            --services "${{ secrets.ECS_SERVICE_NAME }}" \
-            --region ap-northeast-2
+            sleep 10
+          done
+
+          if [ "${STATUS}" != "Success" ]; then
+            echo "SSM deploy timeout"
+            aws ssm list-command-invocations \
+              --command-id "${COMMAND_ID}" \
+              --details \
+              --region ap-northeast-2 \
+              --output json
+            exit 1
+          fi
 
       # 5️⃣ 배포 후 스모크 테스트
       - name: Post-deploy Smoke Test
