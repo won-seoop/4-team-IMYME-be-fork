@@ -54,24 +54,18 @@ jobs:
       # - name: Run Checkstyle
       #   run: ./gradlew checkstyleMain
 
-      # 7. 테스트
-      - name: Run Tests
-        run: ./gradlew test
+      # 7. 테스트 + 빌드
+      - name: Build and Test
+        run: ./gradlew build
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      # 8. ECS 배포용 도커 이미지 빌드
-      - name: Build Docker image (with cache)
-        uses: docker/build-push-action@v6
+      # 8. JAR artifact 업로드 (CD에서 재사용)
+      - name: Upload JAR artifact
+        uses: actions/upload-artifact@v4
         with:
-          context: .
-          file: ./Dockerfile
-          push: false
-          platforms: linux/arm64
-          tags: 219268921033.dkr.ecr.ap-northeast-2.amazonaws.com/imyme-backend:${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          name: app-jar
+          path: build/libs/*.jar
+          retention-days: 1
+
 
   ci-notify-success:
     needs: ci
@@ -115,6 +109,13 @@ jobs:
       # CD에서도 Dockerfile/배포 리소스를 사용하므로 소스 체크아웃
       - name: Checkout code
         uses: actions/checkout@v4
+
+      # CI에서 빌드한 JAR 다운로드
+      - name: Download JAR artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: app-jar
+          path: build/libs
 
       # AWS API 호출(ECR push, ECS update)을 위한 자격 증명 설정
       - name: Configure AWS credentials
