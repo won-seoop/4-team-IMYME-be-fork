@@ -9,8 +9,8 @@ RUN addgroup -S spring && adduser -S spring -G spring
 # Copy pre-built jar from CI artifact
 COPY build/libs/*.jar app.jar
 
-# Change ownership
-RUN chown spring:spring app.jar
+# Create logs directory and set ownership
+RUN mkdir -p logs && chown -R spring:spring app.jar logs
 
 USER spring
 
